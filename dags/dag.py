@@ -3,23 +3,27 @@ from airflow.operators.python_operator import PythonOperator
 from airflow.utils.dates import datetime, timedelta
 from include.eczachly.trino_queries import execute_trino_query, run_trino_query_dq_check
 from airflow.models import Variable
-tabular_credential = Variable.get("TABULAR_CREDENTIAL")
-polygon_api_key = Variable.get('POLYGON_CREDENTIALS', deserialize_json=True)['AWS_SECRET_ACCESS_KEY']
-# TODO make sure to rename this if you're testing this dag out!
-schema = 'zachwilson'
+from databricks import sql
+import os
+
+polygon_api_key = os.getenv("POLYGON_TOKEN")
+server_hostname = os.getenv("DATABRICKS_HOST")
+http_path = os.getenv("DATABRICKS_HTTP_PATH")
+access_token = os.getenv("DATABRICKS_TOKEN")
+
+schema = 'jakebuto'
 @dag(
-    description="A dag for your homework, it takes polygon data in and cumulates it",
+    description="Takes polygon data in and cumulates it",
     default_args={
         "owner": schema,
-        "start_date": datetime(2025, 1, 9),
+        "start_date": datetime(2025, 12, 17),
         "retries": 0,
         "execution_timeout": timedelta(hours=1),
     },
-    start_date=datetime(2025, 1, 9),
+    start_date=datetime(2025, 12, 17),
     max_active_runs=1,
     schedule_interval="@daily",
-    catchup=True,
-    tags=["community"],
+    catchup=False,
 )
 def starter_dag():
     maang_stocks = ['AAPL', 'AMZN', 'NFLX', 'GOOGL', 'META']
