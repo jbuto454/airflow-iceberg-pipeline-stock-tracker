@@ -403,6 +403,13 @@ def starter_dag():
     )
 
     # TODO figure out the right dependency chain
+    (
+        [create_staging_table_step, create_prod_table_step, create_cumulative_step]
+        >> load_to_staging_step
+        >> run_dq_check
+        >> clear_step
+        >> exchange_data_from_staging
+        >> [drop_staging_table, clear_cumulative_step >> cumulate_step]
+    )
 
-
-starter_dag()
+dag()
