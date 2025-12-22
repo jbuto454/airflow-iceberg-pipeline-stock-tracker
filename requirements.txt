@@ -2,4 +2,3 @@
 databricks-sql-connector
 apache-airflow-providers-databricks
 massive
-trino

@@ -12,20 +12,16 @@ access_token = os.getenv("DATABRICKS_TOKEN")
 
 schema = 'jakebuto'
 
-def execute_databricks_query(query, fetch):
-    # Trino connection to Databricks catalog
-    conn = dbapi.connect(
-        host='trino',  # Your Trino server
-        port=8080,
-        user='airflow',
-        catalog='databricks',  # The Databricks catalog in Trino
-        schema=schema          # Your Databricks catalog.schema
-    )
 
+def execute_databricks_query(query, fetch=False):
+    conn = sql.connect(
+        server_hostname=server_hostname,
+        http_path=http_path,
+        access_token=access_token
+    )
     cursor = conn.cursor()
     cursor.execute(query)
 
-    #if the user wants to return query results
     if fetch:
         results = cursor.fetchall()
         cursor.close()
