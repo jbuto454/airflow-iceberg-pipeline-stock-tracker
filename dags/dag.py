@@ -5,6 +5,7 @@ from databricks import sql
 from massive import RESTClient
 import os
 
+#get the environment variables
 polygon_api_key = os.getenv("POLYGON_TOKEN")
 server_hostname = os.getenv("DATABRICKS_HOST")
 http_path = os.getenv("DATABRICKS_HTTP_PATH")
@@ -13,30 +14,36 @@ access_token = os.getenv("DATABRICKS_TOKEN")
 schema = 'jakebuto'
 
 
+#helper function to execute queries in databricks
+#prints the result of the query if fetch is set to True
 def execute_databricks_query(query, fetch):
+    #create the connector object using the databricks environment variables
     conn = sql.connect(
         server_hostname=server_hostname,
         http_path=http_path,
         access_token=access_token
     )
+    #creates the cursor object, and uses it to run the query
     cursor = conn.cursor()
     cursor.execute(query)
 
+    #if fetch is enabled, then print the results of the query
     if fetch:
         results = cursor.fetchall()
         for row in results:
-            print(row)  # Shows up in task logs
+            print(row)
         cursor.close()
         conn.close()
-        return None  # Don't push to XCom
+        return None
 
+    #clean up the connection and cursor objects before returning
     cursor.close()
     conn.close()
     return None
 
 
 @dag(
-    description="Takes polygon data in and cumulates it",
+    description="Takes massive stock data in, stores it as a daily partition, and stores a 7-day cumulative partition",
     default_args={
         "owner": schema,
         "start_date": datetime(2025, 12, 17),
@@ -45,27 +52,29 @@ def execute_databricks_query(query, fetch):
     },
     start_date=datetime(2025, 12, 17),
     max_active_runs=1,
-    schedule="@daily",  # Changed from schedule_interval
+    schedule="@daily",
     catchup=False,
 )
+#
 def stock_dag():
+    #intiliaze variables used in the dag
     maang_stocks = ['AAPL', 'AMZN', 'NFLX', 'GOOGL', 'META']
     production_table = f'{schema}.daily_stock_prices'
     staging_table = production_table + '_stg_{{ ds_nodash }}'
     cumulative_table = f'{schema}.daily_stock_prices_cumulative'
-    yesterday_ds = '{{ yesterday_ds }}'
-    ds = '{{ ds }}'
 
 
-
-    # todo figure out how to load data from polygon into Iceberg
+    #gets stock related data from massive and inserts it into the staging table as a daily partition
     def load_data_from_polygon(table, **context):
+        #intialize variables
         ds = context['ds']
         aggs = []
         client = RESTClient(api_key=polygon_api_key)
 
         print(f"Getting data for date: {ds}")
 
+        #loops through the list of target stocks and gets available data from the massive api
+        #inserts the data into the staging table
         for i in range(0, len(maang_stocks)):
             try:
                 for a in client.list_aggs(
@@ -94,15 +103,15 @@ def stock_dag():
                                 CURRENT_TIMESTAMP
                             )
                         """
-
+                    #calls the execute query function to run the insert into query
                     execute_databricks_query(query, False)
 
                     break
-
+            #throws an exception if there is an issue fetching the data from the massive api
             except Exception as e:
                 print(f"Error fetching {maang_stocks[i]}: {e}")
 
-
+    #initial step to create the schema if it doesn't already exist
     create_schema_step = PythonOperator(
         task_id="create_schema_step",
         python_callable=execute_databricks_query,
@@ -113,7 +122,7 @@ def stock_dag():
     )
 
 
-    # TODO create schema for daily stock price summary table
+    #Creates the production table as a daily partition if it doesn't exist
     create_prod_table_step = PythonOperator(
         task_id="create_production_step",
         python_callable=execute_databricks_query,
@@ -141,7 +150,7 @@ def stock_dag():
         }
     )
 
-    # TODO create the schema for your staging table
+    #Creates the staging table using the same structure as the production table
     create_staging_table_step = PythonOperator(
         task_id="create_staging_step",
         python_callable=execute_databricks_query,  # Use YOUR function name
@@ -169,7 +178,8 @@ def stock_dag():
         }
     )
 
-    # todo make sure you load into the staging table not production
+    #step to execute the load_data_from_polygon function
+    #used to fill the staging table
     load_to_staging_step = PythonOperator(
         task_id="load_to_staging_step",
         python_callable=load_data_from_polygon,
@@ -178,7 +188,13 @@ def stock_dag():
         },
     )
 
-    # TODO figure out some nice data quality checks
+    #runs the following data quality checks:
+    #1. checks that all MAANG stocks are present in the data
+    #2. checks that there are no NULLS in the sotck price data
+    #3. checks that there are no strange price ranges (i.e. low > high)
+    #4. checks that there are no records with negative or zero volume
+    #5. checks that the date value in the data matches the most recent complete day
+    #6. checks that the stock tickers are valid
     run_dq_check = PythonOperator(
         task_id="run_dq_check",
         python_callable=execute_databricks_query,
@@ -266,7 +282,8 @@ def stock_dag():
     )
 
 
-    # todo make sure you clear out production to make things idempotent
+    #clears the production table for the given data
+    #prevents duplicate data being written to production
     clear_step = PythonOperator(
         task_id="clear_step",
         depends_on_past=True,
@@ -282,6 +299,7 @@ def stock_dag():
         }
     )
 
+    #takes the data from staging and moves it to production tables
     exchange_data_from_staging = PythonOperator(
         task_id="exchange_data_from_staging",
         python_callable=execute_databricks_query,
@@ -295,7 +313,8 @@ def stock_dag():
         }
     )
 
-    # TODO do not forget to clean up
+    #drops the staging table after data is loaded to production
+    #there is no use for the staging table in this dag after production data is successfully loaded
     drop_staging_table = PythonOperator(
         task_id="drop_staging_table",
         python_callable=execute_databricks_query,
@@ -309,7 +328,7 @@ def stock_dag():
         }
     )
 
-    # TODO create the schema for your cumulative table
+    #Creates the cumulative table with a daily partition
     create_cumulative_step = PythonOperator(
         task_id="create_cumulative_step",
         python_callable=execute_databricks_query,
@@ -338,6 +357,8 @@ def stock_dag():
         }
     )
 
+    #clears the cumulative table for the given day
+    #prevents dupicate data from being loaded
     clear_cumulative_step = PythonOperator(
         task_id="clear_cumulative_step",
         depends_on_past=True,
@@ -354,7 +375,8 @@ def stock_dag():
     )
 
 
-    # TODO make sure you create array metrics for the last 7 days of stock prices
+    #takes the data from the production table, calculates cumulative metrics
+    #and inserts them into the cumulative table
     cumulate_step = PythonOperator(
         task_id="cumulate_step",
         depends_on_past=True,
@@ -418,7 +440,7 @@ def stock_dag():
         }
     )
 
-    # TODO figure out the right dependency chain
+    #Dependency chain
     (
         create_schema_step
         >> [create_staging_table_step, create_prod_table_step, create_cumulative_step]
