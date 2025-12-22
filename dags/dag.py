@@ -1,7 +1,6 @@
-from airflow.decorators import dag
-from airflow.operators.python_operator import PythonOperator
-from airflow.utils.dates import datetime, timedelta
-from airflow.models import Variable
+from airflow.sdk import dag  # or from airflow.sdk.dag import dag
+from airflow.providers.standard.operators.python import PythonOperator
+from datetime import datetime, timedelta
 from trino import dbapi
 from massive import RESTClient
 import os
@@ -16,7 +15,7 @@ schema = 'jakebuto'
 def execute_databricks_query(query, fetch):
     # Trino connection to Databricks catalog
     conn = dbapi.connect(
-        host='localhost',  # Your Trino server
+        host='trino',  # Your Trino server
         port=8080,
         user='airflow',
         catalog='databricks',  # The Databricks catalog in Trino
@@ -48,10 +47,10 @@ def execute_databricks_query(query, fetch):
     },
     start_date=datetime(2025, 12, 17),
     max_active_runs=1,
-    schedule_interval="@daily",
+    schedule="@daily",  # Changed from schedule_interval
     catchup=False,
 )
-def starter_dag():
+def stock_dag():
     maang_stocks = ['AAPL', 'AMZN', 'NFLX', 'GOOGL', 'META']
     production_table = f'{schema}.daily_stock_prices'
     staging_table = production_table + '_stg_{{ ds_nodash }}'
@@ -93,7 +92,7 @@ def starter_dag():
                                 {a.volume},
                                 {a.vwap},
                                 {a.timestamp},
-                                {a.transactions}
+                                {a.transactions},
                                 CURRENT_TIMESTAMP
                             )
                         """
@@ -130,7 +129,8 @@ def starter_dag():
              USING ICEBERG
              PARTITIONED BY (date)
              COMMENT 'Production table for MAANG stock prices'
-             """
+             """,
+            'fetch': False
         }
     )
 
@@ -156,7 +156,9 @@ def starter_dag():
                 )
                 USING ICEBERG
                 COMMENT 'Staging table for {{ ds }} - will be dropped after load'
-                """
+                """,
+            'fetch': False
+
         }
     )
 
@@ -167,7 +169,6 @@ def starter_dag():
         op_kwargs={
             'table': staging_table,
         },
-        provide_context=True
     )
 
     # TODO figure out some nice data quality checks
@@ -264,11 +265,13 @@ def starter_dag():
         depends_on_past=True,
         python_callable=execute_databricks_query,
         op_kwargs={
-              'query': f"""
+            'query': f"""
             -- Delete existing data for this date (idempotence)
             DELETE FROM {production_table}
             WHERE date = DATE '{{{{ ds }}}}'
-            """
+            """,
+            'fetch': False
+
         }
     )
 
@@ -277,13 +280,14 @@ def starter_dag():
         task_id="exchange_data_from_staging",
         python_callable=execute_databricks_query,
         op_kwargs={
-            'query': """
-                          INSERT INTO {production_table}
-                          SELECT * FROM {staging_table} 
-                          WHERE ds = DATE('{ds}')
-                      """.format(production_table=production_table,
-                                 staging_table=staging_table,
-                                 ds='{{ ds }}')
+            'query': f"""
+                INSERT INTO {production_table}
+                SELECT * FROM {staging_table} 
+                WHERE ds = DATE('{ds}')
+                """.format(production_table=production_table,
+                           staging_table=staging_table, ds='{{ ds }}'),
+            'fetch': False
+
         }
     )
 
@@ -295,7 +299,9 @@ def starter_dag():
             'query': f"""
                 -- Clean up staging table after successful load
                 DROP TABLE IF EXISTS {staging_table}
-                """
+                """,
+            'fetch': False
+
         }
     )
 
@@ -322,7 +328,9 @@ def starter_dag():
                 USING ICEBERG
                 PARTITIONED BY (date)
                 COMMENT '7-day rolling window metrics for MAANG stocks'
-                """
+                """,
+            'fetch': False
+
         }
     )
 
@@ -335,7 +343,9 @@ def starter_dag():
              -- Delete existing data for this date (idempotence)
              DELETE FROM {cumulative_table}
              WHERE date = DATE '{{{{ ds }}}}'
-             """
+             """,
+            'fetch': False
+
         }
     )
 
@@ -346,59 +356,61 @@ def starter_dag():
         depends_on_past=True,
         python_callable=execute_databricks_query,
         op_kwargs={
-                    'query': f"""
-            -- Calculate 7-day rolling arrays from production table
-            INSERT INTO {cumulative_table}
-            WITH daily_prices AS (
-                -- Get last 7 days of data (including today)
-                SELECT 
-                    ticker,
-                    date,
-                    open,
-                    high,
-                    low,
-                    close,
-                    volume
-                FROM {production_table}
-                WHERE date >= DATE '{{{{ ds }}}}' - INTERVAL 7 DAYS
-                AND date <= DATE '{{{{ ds }}}}'
-                ORDER BY ticker, date
-            ),
-            rolling_windows AS (
+            'query': f"""
+                -- Calculate 7-day rolling arrays from production table
+                INSERT INTO {cumulative_table}
+                WITH daily_prices AS (
+                    -- Get last 7 days of data (including today)
+                    SELECT 
+                        ticker,
+                        date,
+                        open,
+                        high,
+                        low,
+                        close,
+                        volume
+                    FROM {production_table}
+                    WHERE date >= DATE '{{{{ ds }}}}' - INTERVAL 7 DAYS
+                    AND date <= DATE '{{{{ ds }}}}'
+                    ORDER BY ticker, date
+                ),
+                rolling_windows AS (
+                    SELECT
+                        ticker,
+                        date,
+                        -- Create arrays of last 7 values (or fewer for first days)
+                        ARRAY_AGG(open) OVER w as last_7_days_open,
+                        ARRAY_AGG(high) OVER w as last_7_days_high,
+                        ARRAY_AGG(low) OVER w as last_7_days_low,
+                        ARRAY_AGG(close) OVER w as last_7_days_close,
+                        ARRAY_AGG(volume) OVER w as last_7_days_volume,
+                        -- Calculate 7-day average volume
+                        AVG(volume) OVER w as avg_7_day_volume,
+                        -- Calculate 7-day volatility (std deviation of closing prices)
+                        STDDEV(close) OVER w as volatility_7_day
+                    FROM daily_prices
+                    WINDOW w AS (
+                        PARTITION BY ticker
+                        ORDER BY date
+                        ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+                    )
+                )
                 SELECT
                     ticker,
                     date,
-                    -- Create arrays of last 7 values (or fewer for first days)
-                    ARRAY_AGG(open) OVER w as last_7_days_open,
-                    ARRAY_AGG(high) OVER w as last_7_days_high,
-                    ARRAY_AGG(low) OVER w as last_7_days_low,
-                    ARRAY_AGG(close) OVER w as last_7_days_close,
-                    ARRAY_AGG(volume) OVER w as last_7_days_volume,
-                    -- Calculate 7-day average volume
-                    AVG(volume) OVER w as avg_7_day_volume,
-                    -- Calculate 7-day volatility (std deviation of closing prices)
-                    STDDEV(close) OVER w as volatility_7_day
-                FROM daily_prices
-                WINDOW w AS (
-                    PARTITION BY ticker
-                    ORDER BY date
-                    ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
-                )
-            )
-            SELECT
-                ticker,
-                date,
-                last_7_days_open,
-                last_7_days_high,
-                last_7_days_low,
-                last_7_days_close,
-                last_7_days_volume,
-                avg_7_day_volume,
-                COALESCE(volatility_7_day, 0) as volatility_7_day,
-                CURRENT_TIMESTAMP
-            FROM rolling_windows
-            WHERE date = DATE '{{{{ ds }}}}'  -- Only insert today's calculated metrics
-            """
+                    last_7_days_open,
+                    last_7_days_high,
+                    last_7_days_low,
+                    last_7_days_close,
+                    last_7_days_volume,
+                    avg_7_day_volume,
+                    COALESCE(volatility_7_day, 0) as volatility_7_day,
+                    CURRENT_TIMESTAMP
+                FROM rolling_windows
+                WHERE date = DATE '{{{{ ds }}}}'  -- Only insert today's calculated metrics
+                """,
+            'fetch': False
+
         }
     )
 
@@ -412,4 +424,4 @@ def starter_dag():
         >> [drop_staging_table, clear_cumulative_step >> cumulate_step]
     )
 
-dag()
+stock_dag()

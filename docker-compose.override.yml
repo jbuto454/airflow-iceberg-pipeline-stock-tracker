@@ -1,0 +1,14 @@
+version: '3'
+services:
+  trino:
+    image: trinodb/trino:latest
+    ports:
+      - "8085:8080"
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog
+    networks:
+      - airflow-iceberg-pipeline-stock-tracker_bc0512_airflow
+
+networks:
+  airflow-iceberg-pipeline-stock-tracker_bc0512_airflow:
+    external: true
