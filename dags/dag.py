@@ -1,7 +1,7 @@
 from airflow.sdk import dag  # or from airflow.sdk.dag import dag
 from airflow.providers.standard.operators.python import PythonOperator
 from datetime import datetime, timedelta
-from trino import dbapi
+from databricks import sql
 from massive import RESTClient
 import os
 
@@ -13,7 +13,7 @@ access_token = os.getenv("DATABRICKS_TOKEN")
 schema = 'jakebuto'
 
 
-def execute_databricks_query(query, fetch=False):
+def execute_databricks_query(query, fetch):
     conn = sql.connect(
         server_hostname=server_hostname,
         http_path=http_path,
@@ -24,9 +24,11 @@ def execute_databricks_query(query, fetch=False):
 
     if fetch:
         results = cursor.fetchall()
+        for row in results:
+            print(row)  # Shows up in task logs
         cursor.close()
         conn.close()
-        return results
+        return None  # Don't push to XCom
 
     cursor.close()
     conn.close()
@@ -100,6 +102,15 @@ def stock_dag():
             except Exception as e:
                 print(f"Error fetching {maang_stocks[i]}: {e}")
 
+
+    create_schema_step = PythonOperator(
+        task_id="create_schema_step",
+        python_callable=execute_databricks_query,
+        op_kwargs={
+            'query': f"CREATE SCHEMA IF NOT EXISTS {schema}",
+            'fetch': False
+        }
+    )
 
 
     # TODO create schema for daily stock price summary table
@@ -271,19 +282,16 @@ def stock_dag():
         }
     )
 
-
     exchange_data_from_staging = PythonOperator(
         task_id="exchange_data_from_staging",
         python_callable=execute_databricks_query,
         op_kwargs={
             'query': f"""
                 INSERT INTO {production_table}
-                SELECT * FROM {staging_table} 
-                WHERE ds = DATE('{ds}')
-                """.format(production_table=production_table,
-                           staging_table=staging_table, ds='{{ ds }}'),
+                SELECT * FROM {staging_table}
+                WHERE date = DATE('{{{{ ds }}}}')
+            """,
             'fetch': False
-
         }
     )
 
@@ -412,7 +420,8 @@ def stock_dag():
 
     # TODO figure out the right dependency chain
     (
-        [create_staging_table_step, create_prod_table_step, create_cumulative_step]
+        create_schema_step
+        >> [create_staging_table_step, create_prod_table_step, create_cumulative_step]
         >> load_to_staging_step
         >> run_dq_check
         >> clear_step
